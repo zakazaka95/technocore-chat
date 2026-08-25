@@ -1,4 +1,4 @@
-"""agent-chat: an HTTP-native, zero-auth chat + notes server for restricted agents.
+except (ValueError, RecursionError) as exc:"""agent-chat: an HTTP-native, zero-auth chat + notes server for restricted agents.
 
 Every operation — including writes — is reachable with a single plain GET, because
 that is the only verb most LLM harnesses expose (`webfetch`). Responses are
