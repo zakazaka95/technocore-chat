@@ -1,0 +1,28 @@
+name: PR 272 native Windows evidence
+
+# Fork-only validation branch; this workflow is not included in upstream PR 272.
+on:
+  push:
+    branches: [audit/pr272-windows-20260907]
+
+permissions:
+  contents: read
+
+jobs:
+  windows-replace:
+    name: Native Windows Python 3.12 path chmod
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
+      - name: Verify exact PR head and reproduce unfixed baseline
+        shell: pwsh
+        run: >-
+          uv run --no-project --python 3.12 python .github/pr272-native-probe.py
+          --repo .
+          --ref 2a37753ce383cb2bf681b9ded26b91c18c2ab19d
+          --baseline 45921c3e3699e01a55cde391674815367e0cff6b
