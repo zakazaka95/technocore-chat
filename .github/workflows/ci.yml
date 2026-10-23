@@ -1,221 +1,126 @@
-name: CI
+name: Verify 107 and 614 integration
 
-# No path filters: this is a world-writable internet-facing service, so no change should
-# merge having run none of this. Cheap — Python plus one slim image build — and the image
-# build is here because nothing else exercises the Dockerfile.
+# Fork-only verification branch: never a production PR or an automatic push job.
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-    branches: [main]
+
+permissions:
+  contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
-  # A newer commit makes an older build result obsolete on both PRs and main.
+  group: verify-107-614-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  # Separate job, not a step in `test`: this one downloads a Pyodide toolchain and an npm
-  # wrangler, which has nothing to do with the service and would push a 10-minute budget.
-  # It exists because the deploy path had three independent breakages that every other gate
-  # in this file was blind to — the bundle would not resolve, the Worker would not start,
-  # and it served one request per isolate — and none of them is visible from Python tests.
-  worker:
-    name: "mcp worker bundles"
+  integration:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
-    permissions:
-      contents: read
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 2
       - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
-          enable-cache: true
-
-      # pywrangler installs prebuilt wheels only, so the wrapper has to be a wheel before
-      # the Worker can bundle it. This is the step a human forgets; here it cannot be.
-      - name: Build the wrapper wheel the Worker resolves against
-        # `-o` is relative to the working directory, not to `--project`, so the wheel has
-        # to be aimed at mcp/dist — that is where the Worker's `find-links = ["../dist"]`
-        # looks, and a repo-root `dist/` leaves it resolving against an absent directory.
-        run: uv build --wheel -o mcp/dist --project mcp
-
-      # `--dry-run` resolves against the Pyodide index and bundles without deploying, which
-      # is where all three breakages showed up. It needs no Cloudflare credentials.
-      #
-      # The `grep -q ERROR` is not belt-and-braces: pywrangler exits 0 when the Pyodide
-      # install fails, so the exit code alone reports a broken bundle as a pass. Fail on
-      # the log instead, and print it either way.
-      - name: Resolve and bundle the Worker
-        working-directory: mcp/worker
-        run: |
-          set -o pipefail
-          uv run pywrangler deploy --dry-run 2>&1 | tee bundle.log
-          if grep -qE '^ERROR|Installation of packages into the Python Worker failed' bundle.log; then
-            echo "::error::pywrangler reported an error while exiting 0 — the bundle is broken."
-            exit 1
-          fi
-          grep -q 'Total Upload' bundle.log || {
-            echo "::error::pywrangler produced no bundle."; exit 1; }
-
-  test:
-    name: "lint + tests + image"
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
-    permissions:
-      contents: read
-    steps:
-      # Full commit pins are the only immutable form for third-party actions. Dependabot
-      # updates these SHAs and the release comments together.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          # Runs PR-controlled code (the service and its tests), so no checkout
-          # credentials are persisted where that code could read them.
-          persist-credentials: false
-
-      # Installs the interpreter named in .python-version, so CI, local dev and the
-      # image all run the same 3.12.
-      # Resolved from the full release version to an immutable commit: setup-uv stopped
-      # publishing floating major tags after v7, and Dependabot bumps this SHA.
-      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
-        with:
-          enable-cache: true
+          enable-cache: false
       - run: uv sync --frozen
 
-      # One command, defined once, in the repo-root justfile: ruff, the formatter in
-      # --check mode, ty, `sz.py --caps` and the coverage run. Spelling the list out here
-      # as well would give a contributor a second copy to fall behind — CONTRIBUTING names
-      # the recipe, and this step is the same recipe, so "run what CI runs" is literal.
-      # Why each command is in that list is commented beside it in the justfile.
-      - name: Lint, types, core size and tests
+      - name: Verify exact source heads and the unchanged production patch
+        run: |
+          git fetch --depth=1 origin 73a732497a19cac11aff4dcb527bae3c52b02f73 7ae91b493c51d7c7d0572db820710a41de98244d
+          uv run python - <<'PY'
+          import pathlib
+          import subprocess
+
+          main = "73a732497a19cac11aff4dcb527bae3c52b02f73"
+          original_107 = "7ae91b493c51d7c7d0572db820710a41de98244d"
+          original_614 = "1c8d71ed1469269aee59edf086af20bc76190af9"
+
+          def source(revision):
+              return subprocess.check_output(["git", "show", f"{revision}:src/store.py"]).decode()
+
+          def apply_107(text):
+              changes = (
+                  ('rec = {"seq": 0, "ts": _now(), "from": valid_name(nick), "text": clean_text(text)}',
+                   'rec = {"seq": 0, "ts": "", "from": valid_name(nick), "text": clean_text(text)}'),
+                  ('rec = {"seq": 0, "ts": _now(), "from": did, "text": clean_text(text), "nonce": nonce}',
+                   'rec = {"seq": 0, "ts": "", "from": did, "text": clean_text(text), "nonce": nonce}'),
+                  ('rec["seq"] = last_seq(root, room) + 1',
+                   'rec.update(seq=last_seq(root, room) + 1, ts=_now())'),
+              )
+              for before, after in changes:
+                  assert text.count(before) == 1, before
+                  text = text.replace(before, after, 1)
+              return text
+
+          assert apply_107(source(main)) == source(original_107)
+          assert apply_107(source(original_614)) == pathlib.Path("src/store.py").read_text(encoding="utf-8")
+          changed = subprocess.check_output(
+              ["git", "diff", "--name-only", original_614, "--", "src/"]
+          ).decode().splitlines()
+          assert changed == ["src/store.py"], changed
+          print(f"main: {main}\n107: {original_107}\n614: {original_614}")
+          print("Both production trees differ only by the same three timestamp-under-lock substitutions.")
+          PY
+
+      - name: Negative control for the refreshed 107 regression on exact main
+        run: |
+          git show 73a732497a19cac11aff4dcb527bae3c52b02f73:src/store.py > src/store.py
+          git show 7ae91b493c51d7c7d0572db820710a41de98244d:tests/unit/test_store.py > tests/unit/test_store.py
+          set +e
+          uv run pytest tests/unit/test_store.py::test_concurrent_writers_cannot_put_an_expired_record_after_a_fresh_one -q --junitxml="$RUNNER_TEMP/107-negative.xml"
+          status=$?
+          set -e
+          test "$status" -eq 1
+          uv run python tests/verify_107_614_control.py "$RUNNER_TEMP/107-negative.xml" 2 2 test_concurrent_writers_cannot_put_an_expired_record_after_a_fresh_one 'assert [record["ts"] for record in records]'
+          git show HEAD:tests/unit/test_store.py > tests/unit/test_store.py
+
+      - name: Negative control for export integration on exact 614
+        run: |
+          git show 1c8d71ed1469269aee59edf086af20bc76190af9:src/store.py > src/store.py
+          set +e
+          uv run pytest tests/unit/test_107_614_integration_local.py -q --junitxml="$RUNNER_TEMP/614-negative.xml"
+          status=$?
+          set -e
+          test "$status" -eq 1
+          uv run python tests/verify_107_614_control.py "$RUNNER_TEMP/614-negative.xml" 6 2 test_prelock_interleaving_export_agrees_with_full_scan 'assert export_bytes(tmp_path, room) == expected'
+
+      - name: Combined fix and existing export suites
+        run: |
+          git show HEAD:src/store.py > src/store.py
+          uv run pytest tests/unit/test_107_614_integration_local.py tests/unit/test_export_snapshot.py tests/http/test_export.py -q
+          git diff --exit-code -- src/store.py tests/unit/test_store.py
+
+      - name: Full native Linux checks on the combined tree
         run: uv run just check
 
-      # Measurement with a floor, not a cap on thinking: comments are reported raw (they
-      # are protocol rationale) and only core code-lines are enforced, against the
-      # committed sz-baseline.json. Shrink the core and commit the new floor with
-      # `uv run sz.py --update-baseline`; growing it needs the same, deliberately.
-      #
-      # Outside `just check` because it is the half a contributor cannot run to a verdict:
-      # fork PRs cannot update sz-baseline.json (queue-guard protects that
-      # maintainer-generated file), so the recipe carries the immutable policy caps and the
-      # ratchet against the committed baseline stays on pushes to main, where maintainers
-      # can regenerate it after reviewing the merged change.
-      - name: Core size report and ratchet
-        run: |
-          uv run sz.py
-          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
-            uv run sz.py --check
-          fi
-
-      # The example is the repo's one-command promise made executable: self-booting on
-      # a free port, self-cleaning, deterministic. All four PR-#54 review findings lived
-      # in code no gate ever ran; this — plus tests/http/test_signer.py — is that gate.
-      - name: Run the example end-to-end
-        run: bash examples/beautiful_chat.sh
-
-      # The MCP wrapper is a separate distribution with its own dependency line, so nothing
-      # else would notice a broken pyproject until someone ran `uv publish`. Its tests are
-      # in the suite above; this is the packaging half.
-      - name: Build and verify the MCP wrapper
-        run: |
-          uv build --project mcp --out-dir dist/mcp
-          uv run python tests/verify_mcp_dist.py dist/mcp/*.whl dist/mcp/*.tar.gz
-
-      - name: Build image
-        run: docker build -f docker/Dockerfile -t technocore-chat:ci .
-
-      - name: Smoke the image
-        run: |
-          docker run -d --name technocore-chat-ci -e CHAT_ROOT=/tmp/chat -p 8080:8080 technocore-chat:ci
-          for _ in $(seq 30); do
-            curl -fsS localhost:8080/healthz && break
-            sleep 1
-          done
-          # `~` marks a self-asserted nickname: an unsigned write can never render as a
-          # bare <bot>, so the smoke asserts the unverified form the signed lane guarantees.
-          curl -fsS 'localhost:8080/r/ci/say/bot/hello%20ci' | grep -q '<~bot> hello ci'
-          curl -fsS localhost:8080/r/ci | grep -q 'hello ci'
-          # The metadata documents are built at import from pyproject.toml and store's
-          # constants, so they are also the check that the image copied both — a manifest
-          # that 500s is a delisting from every registry that revalidates.
-          curl -fsS localhost:8080/openapi.json | grep -q '"openapi"'
-          curl -fsS localhost:8080/.well-known/agent.json | grep -q '"content_is_untrusted"'
-          docker rm -f technocore-chat-ci
-
-  # Separate because it needs the service running, and because a red contract check should
-  # point at the contract rather than at "the tests". It fetches the instance's own
-  # /openapi.json, so there is no committed copy to drift.
-  contract:
-    name: "openapi contract"
+  browser:
+    name: humans page in a browser
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-
       - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           enable-cache: true
       - run: uv sync --frozen
-
-      # Tuned so the fuzzer spends its budget on handlers rather than on the parts that
-      # exist to stop it. CHAT_MAX_WAIT is the ceiling `wait` clamps to, and at the
-      # default 10 a few generated long polls cost more than the whole run; without the
-      # rate bumps the limiter answers most of it with a 429 that conforms and checks
-      # nothing. Everything else is the shipped configuration.
+      - name: Node and Playwright
+        working-directory: tests
+        run: |
+          node --version
+          npm ci
+          npx playwright install --with-deps chromium
       - name: Start the service
         run: |
           CHAT_ROOT="$(mktemp -d)" \
-          CHAT_MAX_WAIT=1 \
-          CHAT_RATE_READ=1000000 CHAT_RATE_WRITE=1000000 CHAT_RATE_ROOMS_PER_DAY=1000000 \
             uv run uvicorn --app-dir src app:app --port 8099 --log-level warning &
           for _ in $(seq 30); do
             curl -fsS localhost:8099/healthz && break
             sleep 1
           done
-
-      # Deterministic: --generation-deterministic fixes the generation (superseding
-      # --seed, which the CLI then ignores) and the pinned schemathesis fixes the generator,
-      # so a failure is a change in this service. ~800 requests in under ten seconds.
-      #
-      # Checks are named rather than `all`, because two of the rest assume things this
-      # service breaks on purpose: positive_data_acceptance expects valid input to succeed,
-      # but a valid write to a mailbox or a reserved namespace is refused; and
-      # negative_data_rejection's generator also invents a query parameter the document
-      # does not list and expects a refusal, which this service will never give — ignoring
-      # unknown query parameters is what makes the documented `?n=` cache-buster work at
-      # all. Turning that one mutation off is a config-file setting the CLI has no flag
-      # for, so the negative half of the contract is enforced by tests/test_contract.py
-      # (in-process, on every `pytest`, with `allow-extra-parameters` off and the input
-      # doctrine of docs/design.md §3.5 behind it) rather than here. What this job asserts
-      # is the over-the-wire half: no 500s, every response matching the status, content
-      # type, headers and schema promised, and the two 405 checks, since Allow is the
-      # machine-readable half of a refused method.
-      #
-      # --warnings lists what to *enable*. Three are left out because they can never clear:
-      # missing_auth (POST /r/events only ever 403s, and there are no credentials to
-      # suggest), validation_mismatch (a generated 86-character string is never a valid
-      # Ed25519 signature), missing_test_data (a generated note name has never been
-      # written, and 404 is the right answer). A warning that is always there is one
-      # nobody reads.
-      - name: Check the running service against its own /openapi.json
-        run: |
-          uv run schemathesis run http://localhost:8099/openapi.json \
-            --url http://localhost:8099 \
-            --checks not_a_server_error,status_code_conformance,content_type_conformance,response_headers_conformance,response_schema_conformance,unsupported_method,allow_header_conformance \
-            --phases examples,coverage,fuzzing \
-            --max-examples 25 \
-            --generation-deterministic \
-            --max-response-time 10 \
-            --warnings missing_deserializer,unused_openapi_auth,unsupported_regex,method_not_allowed,constants_extraction,unmatched_filter \
-            --no-color
+      - name: Drive /humans in Chromium
+        run: node tests/humans_ui_probe.mjs 8099
