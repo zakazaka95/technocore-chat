@@ -27,7 +27,7 @@ jobs:
 
       - name: Verify exact source heads and the unchanged production patch
         run: |
-          git fetch --depth=1 origin 73a732497a19cac11aff4dcb527bae3c52b02f73 7ae91b493c51d7c7d0572db820710a41de98244d
+          git fetch --depth=1 origin 73a732497a19cac11aff4dcb527bae3c52b02f73 7ae91b493c51d7c7d0572db820710a41de98244d 1c8d71ed1469269aee59edf086af20bc76190af9
           uv run python - <<'PY'
           import pathlib
           import subprocess
@@ -104,6 +104,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: 7ae91b493c51d7c7d0572db820710a41de98244d
       - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           enable-cache: true
@@ -124,3 +125,44 @@ jobs:
           done
       - name: Drive /humans in Chromium
         run: node tests/humans_ui_probe.mjs 8099
+
+  packaging:
+    name: standalone 107 example, MCP and image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: 7ae91b493c51d7c7d0572db820710a41de98244d
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          enable-cache: false
+      - run: uv sync --frozen
+      - name: Run the example end-to-end
+        run: bash examples/beautiful_chat.sh
+      - name: Build and verify the MCP wrapper
+        run: |
+          uv build --project mcp --out-dir dist/mcp
+          uv run python tests/verify_mcp_dist.py dist/mcp/*.whl dist/mcp/*.tar.gz
+      - name: Build image
+        run: docker build -f docker/Dockerfile -t technocore-chat:ci .
+      - name: Smoke the image
+        run: |
+          docker run -d --name technocore-chat-ci -e CHAT_ROOT=/tmp/chat -p 8080:8080 technocore-chat:ci
+          for _ in $(seq 30); do
+            curl -fsS localhost:8080/healthz && break
+            sleep 1
+          done
+          # `~` marks a self-asserted nickname: an unsigned write can never render as a
+          # bare <bot>, so the smoke asserts the unverified form the signed lane guarantees.
+          curl -fsS 'localhost:8080/r/ci/say/bot/hello%20ci' | grep -q '<~bot> hello ci'
+          curl -fsS localhost:8080/r/ci | grep -q 'hello ci'
+          # The metadata documents are built at import from pyproject.toml and store's
+          # constants, so they are also the check that the image copied both — a manifest
+          # that 500s is a delisting from every registry that revalidates.
+          curl -fsS localhost:8080/openapi.json | grep -q '"openapi"'
+          curl -fsS localhost:8080/.well-known/agent.json | grep -q '"content_is_untrusted"'
+          docker rm -f technocore-chat-ci
